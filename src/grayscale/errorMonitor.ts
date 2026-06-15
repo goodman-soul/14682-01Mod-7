@@ -2,12 +2,13 @@ import { MonitorConfig, ErrorStats, PerformanceStats, MonitorStatus } from './ty
 
 const DEFAULT_CONFIG: MonitorConfig = {
   errorThreshold: 3,
-  slowLoadThreshold: 3000,
-  slowPageThreshold: 5,
+  slowLoadThreshold: 2000,
+  slowPageThreshold: 2,
   checkInterval: 60000,
 };
 
 const STORAGE_KEY = 'grayscale_monitor_data';
+const DISMISSED_KEY = 'grayscale_warning_dismissed';
 
 interface MonitorData {
   errorStats: ErrorStats;
@@ -20,10 +21,13 @@ class ErrorMonitor {
   private data: MonitorData;
   private listeners: Set<(status: MonitorStatus) => void> = new Set();
   private initialized = false;
+  private warningDismissed = false;
+  private rollbackSuppressed = false;
 
   constructor(config?: Partial<MonitorConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.data = this.loadData();
+    this.warningDismissed = localStorage.getItem(DISMISSED_KEY) === 'true';
   }
 
   private loadData(): MonitorData {
@@ -87,10 +91,12 @@ class ErrorMonitor {
   }
 
   private handleError = (event: ErrorEvent): void => {
+    if (this.rollbackSuppressed) return;
     this.recordError(event.error || new Error(event.message));
   };
 
   private handleUnhandledRejection = (event: PromiseRejectionEvent): void => {
+    if (this.rollbackSuppressed) return;
     const error = event.reason instanceof Error
       ? event.reason
       : new Error(String(event.reason));
@@ -98,6 +104,8 @@ class ErrorMonitor {
   };
 
   recordError(error: Error): void {
+    if (this.rollbackSuppressed) return;
+
     this.data.errorStats.count++;
     this.data.errorStats.lastError = {
       name: error.name,
@@ -105,6 +113,8 @@ class ErrorMonitor {
       stack: error.stack,
     } as Error;
     this.data.errorStats.lastErrorTime = Date.now();
+    this.warningDismissed = false;
+    localStorage.removeItem(DISMISSED_KEY);
     this.saveData();
     this.notifyListeners();
   }
@@ -120,6 +130,8 @@ class ErrorMonitor {
   };
 
   recordPageLoad(pagePath: string, loadTime: number): void {
+    if (this.rollbackSuppressed) return;
+
     this.data.performanceStats.slowPages[pagePath] = loadTime;
     this.saveData();
     this.notifyListeners();
@@ -132,7 +144,7 @@ class ErrorMonitor {
     return {
       hasError,
       isSlow,
-      shouldWarn: hasError || isSlow,
+      shouldWarn: (hasError || isSlow) && !this.warningDismissed && !this.rollbackSuppressed,
     };
   }
 
@@ -168,10 +180,32 @@ class ErrorMonitor {
     this.listeners.forEach((callback) => callback(status));
   }
 
+  dismissWarning(): void {
+    this.warningDismissed = true;
+    localStorage.setItem(DISMISSED_KEY, 'true');
+    this.notifyListeners();
+  }
+
   reset(): void {
     this.data = this.createEmptyData();
+    this.warningDismissed = false;
+    localStorage.removeItem(DISMISSED_KEY);
     this.saveData();
     this.notifyListeners();
+  }
+
+  suppressOnRollback(): void {
+    this.rollbackSuppressed = true;
+    this.reset();
+  }
+
+  unsuppress(): void {
+    this.rollbackSuppressed = false;
+    this.reset();
+  }
+
+  isSuppressed(): boolean {
+    return this.rollbackSuppressed;
   }
 
   getConfig(): MonitorConfig {
